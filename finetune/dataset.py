@@ -12,7 +12,12 @@ from PIL import Image
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 from transformers import AutoProcessor, AutoTokenizer
-
+logger=logging.getLogger('my_logger')
+logger.setLevel(logging.DEBUG)
+file_handler=logging.FileHandler(filename='/root/ld/ld_project/MiniCPM-V/finetune/output/log/tokenizer.log')
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
 llama3_chat_template = "{% set loop_messages = messages %}{% for message in loop_messages %}{% set content = '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n\n'+ message['content'] | trim + '<|eot_id|>' %}{% if loop.index0 == 0 %}{% set content = bos_token + content %}{% endif %}{{ content }}{% endfor %}"
 
 class SupervisedDataset(Dataset):
@@ -43,7 +48,10 @@ class SupervisedDataset(Dataset):
         return len(self.raw_data)
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
-        image = Image.open(self.raw_data[i]["image"]).convert("RGB")
+        if "image" in self.raw_data[i]:
+            image = Image.open(self.raw_data[i]["image"]).convert("RGB")
+        else:
+            image = None
         ret = preprocess(
             image,
             self.raw_data[i]["conversations"],
@@ -55,6 +63,15 @@ class SupervisedDataset(Dataset):
             patch_size=self.patch_size,
             batch_vision=self.batch_vision,
         )
+        """ret={
+        "input_ids": ids,
+        "target": target,
+        "image_bound": image_bound,
+        "raw_msg": raw_msg,
+        "position_ids": position_ids
+        "pixel_values": images,
+        "tgt_sizes": tgt_sizes
+        }"""
         ret = dict(
             input_ids=ret["input_ids"],
             position_ids=ret["position_ids"],
@@ -197,11 +214,13 @@ def conversation_to_ids_llama3(conversation, tokenizer):
     raw_msg = tokenizer.apply_chat_template(
         conversation, tokenize=False, add_generation_prompt=False, chat_template=llama3_chat_template,
     )
+
     input_ids = tokenizer.apply_chat_template(
         conversation, tokenize=True, add_generation_prompt=False, chat_template=llama3_chat_template,
     )
-    input_ids = np.array(input_ids)
 
+    input_ids = np.array(input_ids)
+    
     start_header_idxs = np.where(
         input_ids == tokenizer.convert_tokens_to_ids("<|start_header_id|>")
     )[0]
@@ -256,7 +275,10 @@ def preprocess(
     default_image_placeholder = (
         tokenizer.im_start + tokenizer.unk_token * query_nums + tokenizer.im_end
     )
-    if slice_config:
+    if image is None:
+        images = []
+        image_placeholder = ''
+    elif slice_config:
         images = []
         source_image, patches, best_grid = slice_image(
             image,
@@ -287,8 +309,17 @@ def preprocess(
         )
 
     input_dict = conversation_to_ids(conversation, tokenizer, llm_type)
-
-    if batch_vision:
+    """input_dict = {
+        "input_ids": ids,
+        "target": target,
+        "image_bound": image_bound,
+        "raw_msg": raw_msg,
+        "position_ids": position_ids
+    }"""
+    if images ==[]:
+        input_dict["pixel_values"] = []
+        input_dict["tgt_sizes"] =  torch.Tensor([[0,0]])
+    elif batch_vision:
         tgt_sizes = []
         reshape_images = []
         for image in images:
@@ -306,6 +337,15 @@ def preprocess(
         input_dict["pixel_values"] = images
         input_dict["tgt_sizes"] = []
 
+    """{
+        "input_ids": ids,
+        "target": target,
+        "image_bound": image_bound,
+        "raw_msg": raw_msg,
+        "position_ids": position_ids
+        "pixel_values": images,
+        "tgt_sizes": tgt_sizes
+    }"""
     return input_dict
 
 

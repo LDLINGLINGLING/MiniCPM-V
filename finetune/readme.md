@@ -80,22 +80,20 @@ sh finetune_lora.sh
 After training, you could load the model with the path to the adapter. We advise you to use absolute path for your pretrained model. This is because LoRA only saves the adapter and the absolute path in the adapter configuration json file is used for finding out the pretrained model to load.
 
 ```
-from peft import PeftModel
-from transformers import AutoModel
-model_type="openbmb/MiniCPM-Llama3-V-2_5" # or openbmb/MiniCPM-V-2
-path_to_adapter="path_to_your_fine_tuned_checkpoint"
+from peft import AutoPeftModelForCausalLM
 
-model =  AutoModel.from_pretrained(
-        model_type,
-        trust_remote_code=True
-        )
+path_to_adapter="path_to_adapter"
 
-lora_model = PeftModel.from_pretrained(
-    model,
+model = AutoPeftModelForCausalLM.from_pretrained(
+    # path to the output directory
     path_to_adapter,
     device_map="auto",
     trust_remote_code=True
-).eval().cuda()
+).eval()
+
+vpm_resampler_embedtokens_weight = torch.load(f"{path_to_adapter}/vpm_resampler_embedtokens.pt")
+
+msg = model.load_state_dict(vpm_resampler_embedtokens_weight, strict=False)
 ```
 
 
@@ -175,16 +173,14 @@ A: The error as described in [issues 168](https://github.com/OpenBMB/MiniCPM-V/i
 
 1.**Reload the Fine-Tuned Model:** Make sure you correctly load the checkpoint that has been fine-tuned using lora techniques. Use the following code example to guide you:
    ```python
- from peft import AutoPeftModel
+   from peft import AutoPeftModelForCausalLM
 
-path_to_adapter="path_to_your_fine_tuned_checkpoint"
-
-model = AutoPeftModel.from_pretrained(
-    # path to the output directory
-    path_to_adapter,
-    device_map="auto",
-    trust_remote_code=True
-).eval().cuda()
+   model = AutoPeftModelForCausalLM.from_pretrained(
+       'path_to_your_fine_tuned_checkpoint',  # Path to your fine-tuned checkpoint directory
+       output='output/minicpmv2_lora',
+       device_map='auto',
+       trust_remote_code=True
+   ).eval()
    ```
   2.**Update the `model_minicpmv.py` File:**
    - **Verification:** Make sure you verify and update your `model_minicpmv.py` file to ensure it is the latest version.

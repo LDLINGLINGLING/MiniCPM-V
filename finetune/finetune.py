@@ -15,12 +15,31 @@ from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
 from transformers import AutoModel, AutoTokenizer
 from transformers.integrations import deepspeed
 from transformers import AutoModel, AutoTokenizer
-
+from transformers import  BitsAndBytesConfig
 from dataset import SupervisedDataset, data_collator
 from trainer import CPMTrainer
-
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+import GPUtil
 
+logger=logging.getLogger('my_logger')
+logger.setLevel(logging.DEBUG)
+file_handler=logging.FileHandler(filename='/root/ld/ld_project/MiniCPM-V/finetune/output/log/finetune.log')
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+
+quantization_config = BitsAndBytesConfig(
+    load_in_4bit=True,  # 是否进行4bit量化
+    load_in_8bit=False,  # 是否进行8bit量化
+    bnb_4bit_compute_dtype=torch.float16,  # 计算精度设置
+    bnb_4bit_quant_storage=torch.uint8,  # 量化权重的储存格式
+    bnb_4bit_quant_type="nf4",  # 量化格式，这里用的是正太分布的int4
+    bnb_4bit_use_double_quant=True,  # 是否采用双量化，即对zeropoint和scaling参数进行量化
+    llm_int8_enable_fp32_cpu_offload=False,  # 是否llm使用int8，cpu上保存的参数使用fp32
+    llm_int8_has_fp16_weight=False,  # 是否启用混合精度
+    llm_int8_skip_modules=["out_proj", "kv_proj", "lm_head"],  # 不进行量化的模块
+    llm_int8_threshold=6.0,  # llm.int8()算法中的离群值，根据这个值区分是否进行量化
+)
 @dataclass
 class ModelArguments:
     model_name_or_path: Optional[str] = field(default="openbmb/MiniCPM-V-2")
@@ -66,6 +85,42 @@ class LoraArguments:
     lora_layer_replication: Optional[List[Tuple[int, int]]] = None
     lora_layers_to_transform: Optional[List[int]] = None
     lora_layers_pattern: Optional[str] = None
+   
+def maybe_zero_3(param):
+    if hasattr(param, "ds_id"):
+        assert param.ds_status == ZeroParamStatus.NOT_AVAILABLE
+        with zero.GatheredParameters([param]):
+            param = param.data.detach().cpu().clone()
+    else:
+        param = param.detach().cpu().clone()
+    return param
+
+
+# Borrowed from peft.utils.get_peft_model_state_dict
+def get_peft_state_maybe_zero_3(named_params, bias):
+    if bias == "none":
+        to_return = {k: t for k, t in named_params if "lora_" in k}
+    elif bias == "all":
+        to_return = {k: t for k, t in named_params if "lora_" in k or "bias" in k}
+    elif bias == "lora_only":
+        to_return = {}
+        maybe_lora_bias = {}
+        lora_bias_names = set()
+        for k, t in named_params:
+            if "lora_" in k:
+                to_return[k] = t
+                bias_name = k.split("lora_")[0] + "bias"
+                lora_bias_names.add(bias_name)
+            elif "bias" in k:
+                maybe_lora_bias[k] = t
+        for k, t in maybe_lora_bias:
+            if bias_name in lora_bias_names:
+                to_return[bias_name] = t
+    else:
+        raise NotImplementedError
+    to_return = {k: maybe_zero_3(v) for k, v in to_return.items()}
+    return to_return
+
 
 local_rank = None
 def rank0_print(*args):
@@ -75,8 +130,18 @@ def rank0_print(*args):
 
 def safe_save_model_for_hf_trainer(trainer, output_dir: str, bias="none"):
     """Collects the state dict and dump to disk."""
+    # check if zero3 mode enabled
+    if deepspeed.is_deepspeed_zero3_enabled():
+        state_dict = trainer.model_wrapped._zero3_consolidated_16bit_state_dict()
+    else:
+        if trainer.args.use_lora:
+            state_dict = get_peft_state_maybe_zero_3(
+                trainer.model.named_parameters(), bias
+            )
+        else:
+            state_dict = trainer.model.state_dict()
     if trainer.args.should_save and trainer.args.local_rank == 0:
-        trainer.save_model(output_dir,)
+        trainer._save(output_dir, state_dict=state_dict)
 
 
 def make_supervised_data_module(
@@ -96,7 +161,8 @@ def make_supervised_data_module(
 
     rank0_print("Loading data...")
 
-    train_json = json.load(open(data_args.data_path, "r"))
+    train_json = json.load(open(data_args.data_path, "r",encoding='utf-8'))
+    logging.info(f"train_json: {train_json}")
     train_dataset = dataset_cls(
         train_json,
         transform,
@@ -122,13 +188,11 @@ def make_supervised_data_module(
         )
     else:
         eval_dataset = None
-
     return dict(
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator= partial(data_collator, max_length=max_length),
     )
-
 
 def get_parameter_number(model):
     trainable_params, all_param = 0, 0
@@ -160,6 +224,7 @@ def train():
         training_args,
         lora_args,
     ) = parser.parse_args_into_dataclasses()
+    logger.info(f"model_args:{model_args}")
 
     if getattr(training_args, "deepspeed", None) : 
         training_args.distributed_state.distributed_type = DistributedType.DEEPSPEED
@@ -180,14 +245,13 @@ def train():
             logging.warning(
                 "FSDP or ZeRO3 are not incompatible with QLoRA."
             )
-    
+    logger.info(f"lora_args:{lora_args}")
     model = AutoModel.from_pretrained(
-        model_args.model_name_or_path,
-        trust_remote_code=True,
-        torch_dtype=compute_dtype,
-        device_map=device_map,
-    )
-
+            model_args.model_name_or_path,
+            trust_remote_code=True,
+            torch_dtype=compute_dtype,
+            #device_map=device_map,
+        )
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.model_name_or_path, trust_remote_code=True
     )
@@ -196,17 +260,15 @@ def train():
         model.vpm.requires_grad_(False)
     if not training_args.tune_llm:
         model.llm.requires_grad_(False)
-        
+    
     if training_args.use_lora:
+        logger.info("use_lora")
         if training_args.use_lora and training_args.tune_llm:
             raise ValueError("The model cannot simultaneously adjust LLM parameters and apply LoRA.")
             
         rank0_print("Currently using LoRA for fine-tuning the MiniCPM-V model.")
         for name, param in model.llm.named_parameters():
             param.requires_grad = False
-        modules_to_save = ['embed_tokens','resampler']
-        if training_args.tune_vision:
-            modules_to_save.append('vpm')
         lora_config = LoraConfig(
             r=lora_args.lora_r,
             lora_alpha=lora_args.lora_alpha,
@@ -214,17 +276,25 @@ def train():
             lora_dropout=lora_args.lora_dropout,
             bias=lora_args.lora_bias,
             layers_to_transform=lora_args.lora_layers_to_transform,
-            modules_to_save=modules_to_save,
+            task_type="CAUSAL_LM",
         )
         if not hasattr(model, 'get_input_embeddings'):
             def get_input_embeddings(self):
                 return self.llm.get_input_embeddings()
             model.get_input_embeddings = MethodType(get_input_embeddings, model)
         if lora_args.q_lora:
+            gpu_usage = sum([GPUtil.getGPUs()[i].memoryUsed for i in range(torch.cuda.device_count())])
+            logger.info(f"pre_qlora_gpu_usage:{gpu_usage}")
             model = prepare_model_for_kbit_training(
                 model, use_gradient_checkpointing=training_args.gradient_checkpointing
             )
+            gpu_usage = sum([GPUtil.getGPUs()[i].memoryUsed for i in range(torch.cuda.device_count())])
+            logger.info(f"post_qlora_gpu_usage:{gpu_usage}")
         model = get_peft_model(model, lora_config)
+        model.base_model.resampler.requires_grad_(True)
+        model.base_model.llm.model.embed_tokens.weight.requires_grad_(True)#语言模型的embeding要开启梯度，这是因为语言模型最开始做的embeding
+        if training_args.tune_vision:
+            model.base_model.vpm.requires_grad_(True)
         if training_args.gradient_checkpointing:
             model.enable_input_require_grads()
 
@@ -247,7 +317,7 @@ def train():
         batch_vision = model.config.batch_vision_input
     else:
         batch_vision = False
-
+    logger.info(f"model_max_length={training_args.model_max_length}")
     data_module = make_supervised_data_module(
         tokenizer=tokenizer,
         data_args=data_args,
